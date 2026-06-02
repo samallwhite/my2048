@@ -4,7 +4,8 @@
       "Bash(pip show *)",
       "Bash(python -m pytest tests/ -v)",
       "Bash(python -c \"import tkinter\")",
-      "Bash(python -m pytest tests/ -v --tb=short)"
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python *)"
     ]
   }
 }
