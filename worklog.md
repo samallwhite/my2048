@@ -291,6 +291,37 @@ python eval/evaluate.py --weights 15.0 2.0 1.5 10.0
 | `get_feature_values(board)` | 返回四个特征的原始值字典（调试用） |
 | `reset()` | 重置内部状态 |
 
+### GUI AI 可视化
+
+`gui.py` 新增 **AI 自动模式**，可在图形界面中实时观察智能体的决策过程：
+
+- **AI 开关按钮**：点击启动/停止 AI 自动游戏
+- **速度滑条**：50ms（快）⇄ 600ms（慢）可拖拽调节
+- **信息栏**：实时显示步数、方向、四个启发式特征值
+- AI 运行时自动禁用键盘输入，停止后可手动接管
+
+```bash
+python gui.py
+# 点击 "▶ AI 自动" 按钮即可观看
+```
+
+### 评估脚本增强
+
+`eval/evaluate.py` 新增**实时进度**和**断点续训**功能：
+
+- **实时进度条**：显示完成进度、最近N局均分、全局均分、最佳分、方块分布、耗时、ETA
+- **检查点自动保存**：每完成一局自动写入 `eval/checkpoints/`，Ctrl+C 中断后可从断点恢复
+- **断点续训**：`--resume` 自动选择最近检查点，或指定文件路径
+- **检查点管理**：`--list-checkpoints` 列出所有可用检查点
+- **自动清理**：评估正常结束后自动删除检查点文件
+
+```bash
+python eval/evaluate.py --games 200           # 200局评估，自动保存检查点
+python eval/evaluate.py --resume              # 从最近检查点继续
+python eval/evaluate.py --list-checkpoints    # 查看可用检查点
+python eval/evaluate.py --no-checkpoint       # 禁用检查点
+```
+
 ---
 
 ## 环境信息

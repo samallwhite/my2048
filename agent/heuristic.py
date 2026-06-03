@@ -155,109 +155,97 @@ class HeuristicAgent(Agent):
 
         return best_score
 
-    # ── 启发式评价函数 ────────────────────────────────────────────────
+    # ── 启发式评价函数（nneonneo/2048-ai 风格 + NumPy 向量化） ─────
 
     def _evaluate(self, board: Board) -> float:
-        """多特征线性加权启发式评价函数。
+        """逐行启发式评价函数（NumPy 向量化实现）。
 
-        评价 = w_empty * 空格数量
-              + w_monotonicity * 单调性得分
-              + w_smoothness * 平滑度得分
-              + w_max_corner * 最大数靠角得分
+        将棋盘拆为 4 行 + 4 列（共 8 个行向量），每条指令同时处理全部 8 行，
+        用 C 底层循环替代 Python for + pow()。
+
+        公式（每行）:
+          row_score = w_lost_penalty
+                    + w_empty * empty_count
+                    + w_merges * merge_clusters
+                    - w_monotonicity * min(mono_left, mono_right)
+                    - w_sum * sum(rank ^ sum_power)
+
+        参考: nneonneo/2048-ai (github.com/nneonneo/2048-ai)
         """
         w = self.weights
-
-        # 预计算 log2 棋盘（三个特征共用，避免重复计算）
         grid = board.grid
-        log_grid = np.zeros((4, 4), dtype=np.float32)
+
+        # ── 构造 rank 矩阵 ─────────────────────────────────────────
+        ranks = np.zeros((4, 4), dtype=np.float64)
         mask = grid > 0
-        log_grid[mask] = np.log2(grid[mask].astype(np.float32))
+        ranks[mask] = np.log2(grid[mask].astype(np.float64))
 
-        # 计算四个启发式特征
-        empty_score = float(len(board.get_empty_cells()))
-        mono_score = self._monotonicity_from_log(log_grid)
-        smooth_score = self._smoothness_from_log(grid, log_grid)
-        corner_score = self._max_corner_from_log(grid, log_grid)
+        # 拼接为 (8, 4) 矩阵：前 4 行 = 原始行，后 4 行 = 列（转置后当行处理）
+        rows = np.empty((8, 4), dtype=np.float64)
+        rows[0:4] = ranks
+        rows[4:8] = ranks.T
 
-        return (w.w_empty * empty_score +
-                w.w_monotonicity * mono_score +
-                w.w_smoothness * smooth_score +
-                w.w_max_corner * corner_score)
+        # ── ① 空格计数（向量化）───────────────────────────────────
+        empties = np.sum(rows == 0, axis=1)              # (8,) 每行空格数
 
-    # ── 启发式特征实现 ────────────────────────────────────────────────
+        # ── ② sum 惩罚（向量化）──────────────────────────────────
+        nonzero = rows > 0
+        sum_powered = np.where(nonzero, rows ** w.sum_power, 0.0)
+        sum_penalties = np.sum(sum_powered, axis=1)      # (8,) 每行的 Σ rank^3.5
 
-    @staticmethod
-    def _monotonicity_from_log(log_grid: np.ndarray) -> float:
-        """单调性：奖励沿同一方向单调变化的行和列。
+        # ── ③ 单调性（向量化）────────────────────────────────────
+        # diff[i,j] = rows[i,j+1] - rows[i,j]，shape (8, 3)
+        diff = np.diff(rows, axis=1)
+        pow_rows = rows ** w.mono_power                   # (8, 4) rank^4
 
-        对每行/列分别计算递增和递减的累积对数差，
-        取 max(inc, dec) 作为该行/列的单调性得分。
-        使用 log2 确保不同量级差异可比。
-        """
-        total = 0.0
+        # mono_left:  行从左到右递减时累积（diff < 0）
+        left_mask = diff < 0
+        left_contrib = np.where(
+            left_mask,
+            pow_rows[:, :-1] - pow_rows[:, 1:],          # pow(prev) - pow(curr)
+            0.0
+        )
+        mono_left = np.sum(left_contrib, axis=1)          # (8,)
 
-        # 行单调性
-        for i in range(4):
-            inc, dec = 0.0, 0.0
-            for j in range(3):
-                diff = log_grid[i, j] - log_grid[i, j + 1]
-                if diff > 0:       # 从左到右递减
-                    dec += abs(diff)
-                elif diff < 0:     # 从左到右递增
-                    inc += abs(diff)
-            total += max(inc, dec)
+        # mono_right: 行从左到右递增或相等时累积（diff >= 0）
+        right_mask = diff >= 0
+        right_contrib = np.where(
+            right_mask,
+            pow_rows[:, 1:] - pow_rows[:, :-1],          # pow(curr) - pow(prev)
+            0.0
+        )
+        mono_right = np.sum(right_contrib, axis=1)        # (8,)
 
-        # 列单调性
-        for j in range(4):
-            inc, dec = 0.0, 0.0
-            for i in range(3):
-                diff = log_grid[i, j] - log_grid[i + 1, j]
-                if diff > 0:       # 从上到下递减
-                    dec += abs(diff)
-                elif diff < 0:     # 从上到下递增
-                    inc += abs(diff)
-            total += max(inc, dec)
+        # 取两者中较小者作为惩罚（非单调行两边都会累积，min > 0）
+        mono_penalties = np.minimum(mono_left, mono_right)
 
-        return total
-
-    @staticmethod
-    def _smoothness_from_log(grid: np.ndarray, log_grid: np.ndarray) -> float:
-        """平滑度：惩罚相邻方块数值差异过大。
-
-        只计算两个均为非空格子之间的对数差。
-        如 2 和 4 的 log2 差为 1，1024 和 2048 的 log2 差也为 1。
-        """
-        penalty = 0.0
-        for i in range(4):
-            for j in range(4):
-                if grid[i, j] == 0:
+        # ── ④ 合并簇（小循环：8 行 × 4 列，开销可忽略）─────────
+        merges = np.zeros(8, dtype=np.float64)
+        for i in range(8):
+            prev = 0
+            counter = 0
+            for k in range(4):
+                r = int(rows[i, k])
+                if r == 0:
                     continue
-                # 右邻
-                if j + 1 < 4 and grid[i, j + 1] != 0:
-                    penalty += abs(log_grid[i, j] - log_grid[i, j + 1])
-                # 下邻
-                if i + 1 < 4 and grid[i + 1, j] != 0:
-                    penalty += abs(log_grid[i, j] - log_grid[i + 1, j])
+                if prev == r:
+                    counter += 1
+                else:
+                    if counter > 0:
+                        merges[i] += 1 + counter
+                        counter = 0
+                    prev = r
+            if counter > 0:
+                merges[i] += 1 + counter
 
-        return -penalty
+        # ── ⑤ 汇总（向量化）──────────────────────────────────────
+        row_scores = (w.w_lost_penalty
+                      + w.w_empty * empties
+                      + w.w_merges * merges
+                      - w.w_monotonicity * mono_penalties
+                      - w.w_sum * sum_penalties)
 
-    @staticmethod
-    def _max_corner_from_log(grid: np.ndarray, log_grid: np.ndarray) -> float:
-        """最大数靠角：奖励最大方块位于四个角落之一。
-
-        角落位置有助于构建单调递减的蛇形排列。
-        奖励值使用 log2(max_val)，与其余特征保持同一量级。
-        """
-        max_val = np.max(grid)
-        if max_val == 0:
-            return 0.0
-
-        corners = [(0, 0), (0, 3), (3, 0), (3, 3)]
-        for r, c in corners:
-            if grid[r, c] == max_val:
-                return float(np.log2(max_val))
-
-        return 0.0
+        return float(np.sum(row_scores))
 
     # ── 公开接口（供外部调用或调试） ──────────────────────────────────
 
@@ -266,15 +254,64 @@ class HeuristicAgent(Agent):
         return self._evaluate(board)
 
     def get_feature_values(self, board: Board) -> dict[str, float]:
-        """对外暴露：返回四个启发式特征的原始值（用于调试和可视化）。"""
+        """对外暴露：返回逐行评价的汇总指标（用于调试和 GUI 显示）。"""
+        w = self.weights
         grid = board.grid
-        log_grid = np.zeros((4, 4), dtype=np.float32)
+
+        ranks = np.zeros((4, 4), dtype=np.float64)
         mask = grid > 0
-        log_grid[mask] = np.log2(grid[mask].astype(np.float32))
+        ranks[mask] = np.log2(grid[mask].astype(np.float64))
+
+        rows = np.empty((8, 4), dtype=np.float64)
+        rows[0:4] = ranks
+        rows[4:8] = ranks.T
+
+        # 用向量化方式汇总每个特征
+        empties = np.sum(rows == 0, axis=1)
+        total_empty = int(np.sum(empties))
+
+        nonzero = rows > 0
+        sum_powered = np.where(nonzero, rows ** w.sum_power, 0.0)
+        total_sum_penalty = float(np.sum(sum_powered))
+
+        # 合并簇
+        merges = np.zeros(8, dtype=np.float64)
+        for i in range(8):
+            prev = 0
+            counter = 0
+            for k in range(4):
+                r = int(rows[i, k])
+                if r == 0:
+                    continue
+                if prev == r:
+                    counter += 1
+                else:
+                    if counter > 0:
+                        merges[i] += 1 + counter
+                        counter = 0
+                    prev = r
+            if counter > 0:
+                merges[i] += 1 + counter
+        total_merges = int(np.sum(merges))
+
+        # 单调性惩罚
+        diff = np.diff(rows, axis=1)
+        pow_rows = rows ** w.mono_power
+        left_contrib = np.where(
+            diff < 0,
+            pow_rows[:, :-1] - pow_rows[:, 1:], 0.0)
+        right_contrib = np.where(
+            diff >= 0,
+            pow_rows[:, 1:] - pow_rows[:, :-1], 0.0)
+        mono_penalties = np.minimum(
+            np.sum(left_contrib, axis=1),
+            np.sum(right_contrib, axis=1))
+        total_mono_penalty = float(np.sum(mono_penalties))
 
         return {
-            "empty": float(len(board.get_empty_cells())),
-            "monotonicity": self._monotonicity_from_log(log_grid),
-            "smoothness": self._smoothness_from_log(grid, log_grid),
-            "max_corner": self._max_corner_from_log(grid, log_grid),
+            "total_score": self._evaluate(board),
+            "empty_cells": total_empty,
+            "merge_clusters": total_merges,
+            "mono_penalty": total_mono_penalty,
+            "sum_penalty": total_sum_penalty,
         }

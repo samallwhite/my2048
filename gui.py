@@ -247,10 +247,11 @@ class App2048:
             feats = self.ai_agent.get_feature_values(self.game.board)
             self.info_label.config(
                 text=f"#{self.ai_step_count} {_DIR_NAMES[action]} | "
-                     f"空:{feats['empty']:.0f} "
-                     f"单:{feats['monotonicity']:.1f} "
-                     f"滑:{feats['smoothness']:.1f} "
-                     f"角:{feats['max_corner']:.1f}"
+                     f"评分:{feats['total_score']:.0f} "
+                     f"空:{feats['empty_cells']:.0f} "
+                     f"簇:{feats['merge_clusters']:.0f} "
+                     f"单罚:{feats['mono_penalty']:.1f} "
+                     f"和罚:{feats['sum_penalty']:.1f}"
             )
         else:
             self.info_label.config(
