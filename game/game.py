@@ -1,4 +1,5 @@
 import numpy as np
+from game import bitboard
 from game.board import Board, UP, DOWN, LEFT, RIGHT
 
 
@@ -27,7 +28,7 @@ class Game:
         prev_score = self.board.score
         new_board = self.board.execute_move(action)
 
-        if np.array_equal(new_board.grid, self.board.grid):
+        if new_board.bits == self.board.bits:
             return self.board.get_state(), 0, self.board.is_game_over(), {
                 "score": self.board.score,
                 "max_tile": self.board.max_tile,
@@ -46,12 +47,13 @@ class Game:
         }
 
     def _spawn_tile(self) -> None:
-        empty = self.board.get_empty_cells()
-        if not empty:
+        empty_shifts = bitboard.get_empty_shifts(self.board.bits)
+        if not empty_shifts:
             return
-        idx = self.rng.integers(len(empty))
-        r, c = empty[idx]
-        self.board.grid[r, c] = 4 if self.rng.random() < 0.1 else 2
+        idx = self.rng.integers(len(empty_shifts))
+        rank = 2 if self.rng.random() < 0.1 else 1
+        bits = bitboard.spawn_tile(self.board.bits, empty_shifts[idx], rank)
+        self.board = Board(bits=bits, score=self.board.score)
 
     def clone(self) -> "Game":
         """Deep copy including RNG state (essential for expectimax search)."""

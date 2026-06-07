@@ -12,6 +12,7 @@
 """
 
 import numpy as np
+from game import bitboard
 from game.board import Board, UP, DOWN, LEFT, RIGHT
 from agent.base import Agent
 from agent.config import HeuristicWeights
@@ -30,7 +31,6 @@ class HeuristicAgent(Agent):
     # 置换表缓存深度上限（C++ 参考值 15，远大于实际搜索深度）
     _CACHE_DEPTH_LIMIT = 15
     _CPROB_THRESH_BASE = 0.0001
-    _ROW_MASK = 0xffff
 
     def __init__(self,
                  weights: HeuristicWeights | None = None,
@@ -47,7 +47,6 @@ class HeuristicAgent(Agent):
         # 预建查表：65536 种行的启发式得分（一次计算，终生使用）
         self._row_table = self._build_table()
         self._row_scores = self._row_table.tolist()
-        self._row_left_table, self._row_right_table = self._build_move_tables()
 
         # 置换表：每步 get_action 时重建，跨 root 方向共享
         self._trans_table: dict = {}
@@ -68,18 +67,18 @@ class HeuristicAgent(Agent):
         best_action = UP
 
         # C++ 风格自适应深度：方块种类越多越深入
-        distinct = self._count_distinct_tiles(board)
+        distinct = bitboard.count_distinct_tiles(board.bits)
         dynamic_depth = min(self.max_depth, max(3, distinct - 2))
 
         # 每步重建置换表（与 C++ score_toplevel_move 创建 eval_state 一致）
         self._trans_table = {}
 
-        rank_board = self._board_to_rank_int(board)
+        rank_board = board.bits
 
         for direction in _DIRECTIONS:
-            new_board = self._execute_move(direction, rank_board)
+            new_board, _, changed = bitboard.execute_move(rank_board, direction)
 
-            if new_board == rank_board:
+            if not changed:
                 continue
 
             score = self._chance_node(new_board,
@@ -92,18 +91,6 @@ class HeuristicAgent(Agent):
                 best_action = direction
 
         return best_action
-
-    def _count_distinct_tiles(self, board: Board) -> int:
-        """统计棋盘上不同方块 rank 的种类数（不含空格）。
-
-        用于自适应深度计算，与 C++ count_distinct_tiles 等价。
-        """
-        grid = board.grid
-        mask = grid > 0
-        if not mask.any():
-            return 0
-        ranks = np.log2(grid[mask].astype(np.uint64))
-        return int(len(np.unique(ranks)))
 
     # ── 搜索树节点 ────────────────────────────────────────────────────
 
@@ -132,12 +119,7 @@ class HeuristicAgent(Agent):
             if cached is not None and cached[0] <= curdepth:
                 return cached[1]
 
-        empty_shifts = []
-        tmp = board
-        for shift in range(0, 64, 4):
-            if (tmp & 0xf) == 0:
-                empty_shifts.append(shift)
-            tmp >>= 4
+        empty_shifts = bitboard.get_empty_shifts(board)
 
         if not empty_shifts:
             return self._evaluate(board)
@@ -148,14 +130,14 @@ class HeuristicAgent(Agent):
 
         for shift in empty_shifts:
             # 放 2（概率 90%）→ 进入 Max 节点
-            board_2 = board | (1 << shift)
+            board_2 = bitboard.spawn_tile(board, shift, 1)
             value_2 = self._max_node(board_2,
                                      curdepth=curdepth,
                                      depth_limit=depth_limit,
                                      cprob=child_cprob * 0.9)
 
             # 放 4（概率 10%）→ 进入 Max 节点
-            board_4 = board | (2 << shift)
+            board_4 = bitboard.spawn_tile(board, shift, 2)
             value_4 = self._max_node(board_4,
                                      curdepth=curdepth,
                                      depth_limit=depth_limit,
@@ -188,8 +170,8 @@ class HeuristicAgent(Agent):
         next_depth = curdepth + 1
 
         for direction in _DIRECTIONS:
-            new_board = self._execute_move(direction, board)
-            if new_board == board:
+            new_board, _, changed = bitboard.execute_move(board, direction)
+            if not changed:
                 continue
             score = self._chance_node(new_board,
                                       curdepth=next_depth,
@@ -200,115 +182,19 @@ class HeuristicAgent(Agent):
 
         return best_score
 
-    # ── 搜索用 bitboard 工具 ───────────────────────────────────────────
-
-    @staticmethod
-    def _board_to_rank_int(board: Board) -> int:
-        """将外部 Board 转成 C++ 风格的 64-bit rank bitboard。"""
-        packed = 0
-        shift = 0
-        for value in board.grid.reshape(16):
-            v = int(value)
-            if v:
-                packed |= (v.bit_length() - 1) << shift
-            shift += 4
-        return packed
-
-    @staticmethod
-    def _reverse_row(row: int) -> int:
-        return ((row >> 12) |
-                ((row >> 4) & 0x00f0) |
-                ((row << 4) & 0x0f00) |
-                ((row << 12) & 0xf000))
-
-    @staticmethod
-    def _pack_line(line: list[int]) -> int:
-        return (line[0] |
-                (line[1] << 4) |
-                (line[2] << 8) |
-                (line[3] << 12))
-
-    @staticmethod
-    def _slide_rank_line_left(line: list[int]) -> list[int]:
-        tiles = [v for v in line if v != 0]
-        merged = []
-        i = 0
-        while i < len(tiles):
-            if i + 1 < len(tiles) and tiles[i] == tiles[i + 1]:
-                merged.append(min(tiles[i] + 1, 0xf))
-                i += 2
-            else:
-                merged.append(tiles[i])
-                i += 1
-        return merged + [0] * (4 - len(merged))
-
-    def _build_move_tables(self) -> tuple[list[int], list[int]]:
-        """预计算每种 16-bit 行向左/向右移动后的 XOR diff。"""
-        row_left = [0] * 65536
-        row_right = [0] * 65536
-
-        for row in range(65536):
-            line = [
-                (row >> 0) & 0xf,
-                (row >> 4) & 0xf,
-                (row >> 8) & 0xf,
-                (row >> 12) & 0xf,
-            ]
-            result = self._pack_line(self._slide_rank_line_left(line))
-            rev_row = self._reverse_row(row)
-            rev_result = self._reverse_row(result)
-
-            row_left[row] = row ^ result
-            row_right[rev_row] = rev_row ^ rev_result
-
-        return row_left, row_right
-
-    @staticmethod
-    def _transpose(board: int) -> int:
-        a1 = board & 0xF0F00F0FF0F00F0F
-        a2 = board & 0x0000F0F00000F0F0
-        a3 = board & 0x0F0F00000F0F0000
-        a = a1 | (a2 << 12) | (a3 >> 12)
-        b1 = a & 0xFF00FF0000FF00FF
-        b2 = a & 0x00FF00FF00000000
-        b3 = a & 0x00000000FF00FF00
-        return b1 | (b2 >> 24) | (b3 << 24)
-
-    def _execute_rows(self, board: int, table: list[int]) -> int:
-        ret = board
-        ret ^= table[(board >> 0) & self._ROW_MASK] << 0
-        ret ^= table[(board >> 16) & self._ROW_MASK] << 16
-        ret ^= table[(board >> 32) & self._ROW_MASK] << 32
-        ret ^= table[(board >> 48) & self._ROW_MASK] << 48
-        return ret
-
-    def _execute_move(self, direction: int, board: int) -> int:
-        if direction == UP:
-            return self._transpose(
-                self._execute_rows(self._transpose(board), self._row_left_table)
-            )
-        if direction == DOWN:
-            return self._transpose(
-                self._execute_rows(self._transpose(board), self._row_right_table)
-            )
-        if direction == LEFT:
-            return self._execute_rows(board, self._row_left_table)
-        if direction == RIGHT:
-            return self._execute_rows(board, self._row_right_table)
-        raise ValueError(f"Invalid direction: {direction}")
-
     def _evaluate_rank_board(self, board: int) -> float:
         scores = self._row_scores
-        transposed = self._transpose(board)
+        transposed = bitboard.transpose(board)
+        row_mask = bitboard.ROW_MASK
         return float(
-            scores[(board >> 0) & self._ROW_MASK] +
-            scores[(board >> 16) & self._ROW_MASK] +
-            scores[(board >> 32) & self._ROW_MASK] +
-            scores[(board >> 48) & self._ROW_MASK] +
-            scores[(transposed >> 0) & self._ROW_MASK] +
-            scores[(transposed >> 16) & self._ROW_MASK] +
-            scores[(transposed >> 32) & self._ROW_MASK] +
-            scores[(transposed >> 48) & self._ROW_MASK]
+            scores[(board >> 0) & row_mask] +
+            scores[(board >> 16) & row_mask] +
+            scores[(board >> 32) & row_mask] +
+            scores[(board >> 48) & row_mask] +
+            scores[(transposed >> 0) & row_mask] +
+            scores[(transposed >> 16) & row_mask] +
+            scores[(transposed >> 32) & row_mask] +
+            scores[(transposed >> 48) & row_mask]
         )
 
     # ── 查表构建 ──────────────────────────────────────────────────────
@@ -379,18 +265,6 @@ class HeuristicAgent(Agent):
 
         return table.astype(np.float64)
 
-    # ── 行编码工具 ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _pack_rows(ranks: np.ndarray) -> np.ndarray:
-        """将 (4, 4) rank 矩阵的每一行打包为 16-bit 整数。
-
-        rank[i,j] 占 4 bit，一行 4 格 = 16 bit。
-        """
-        r = ranks.astype(np.uint64)
-        return (r[:, 0] | (r[:, 1] << 4) |
-                (r[:, 2] << 8) | (r[:, 3] << 12))
-
     # ── 启发式评价函数（nneonneo/2048-ai 风格 + 查表）──────────────
 
     def _evaluate(self, board: Board | int) -> float:
@@ -403,19 +277,7 @@ class HeuristicAgent(Agent):
         if isinstance(board, int):
             return self._evaluate_rank_board(board)
 
-        grid = board.grid
-
-        # tile 值 → rank（log2）
-        ranks = np.zeros((4, 4), dtype=np.uint64)
-        mask = grid > 0
-        ranks[mask] = np.log2(grid[mask].astype(np.uint64))
-
-        # 4 行编码 + 4 列编码，各查表求和
-        row_codes = self._pack_rows(ranks)       # (4,) uint64
-        col_codes = self._pack_rows(ranks.T)     # (4,) uint64
-
-        return float(np.sum(self._row_table[row_codes]) +
-                     np.sum(self._row_table[col_codes]))
+        return self._evaluate_rank_board(board.bits)
 
     # ── 公开接口（供外部调用或调试） ──────────────────────────────────
 

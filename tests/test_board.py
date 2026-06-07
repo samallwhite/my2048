@@ -120,7 +120,9 @@ def test_valid_moves_detection():
 def test_copy_is_deep():
     b = _make_board([[2, 0, 0, 0], [0, 4, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
     b2 = b.copy()
-    b2.grid[0, 1] = 8
+    grid = b2.grid
+    grid[0, 1] = 8
+    b2.grid = grid
     assert b.grid[0, 1] == 0
     assert b2.grid[0, 1] == 8
 
