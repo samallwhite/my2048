@@ -17,7 +17,11 @@ class Game:
         self._spawn_tile()
         return self.board.get_state()
 
-    def step(self, action: int) -> tuple[np.ndarray, int, bool, dict]:
+    def step(
+        self,
+        action: int,
+        return_state: bool = True,
+    ) -> tuple[np.ndarray | None, int, bool, dict]:
         """
         Execute an action.
 
@@ -29,7 +33,8 @@ class Game:
         new_board = self.board.execute_move(action)
 
         if new_board.bits == self.board.bits:
-            return self.board.get_state(), 0, self.board.is_game_over(), {
+            state = self.board.get_state() if return_state else None
+            return state, 0, self.board.is_game_over(), {
                 "score": self.board.score,
                 "max_tile": self.board.max_tile,
                 "invalid": True,
@@ -40,7 +45,8 @@ class Game:
         self._spawn_tile()
 
         done = self.board.is_game_over()
-        return self.board.get_state(), reward, done, {
+        state = self.board.get_state() if return_state else None
+        return state, reward, done, {
             "score": self.board.score,
             "max_tile": self.board.max_tile,
             "invalid": False,

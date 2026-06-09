@@ -18,6 +18,123 @@ from agent.base import Agent
 from agent.config import HeuristicWeights
 
 _DIRECTIONS = [UP, DOWN, LEFT, RIGHT]
+_ROW_FEATURE_CACHE: dict[
+    tuple[float, float],
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+] = {}
+
+
+def _coerce_weights(
+    weights: HeuristicWeights | list[float] | None,
+) -> HeuristicWeights:
+    if weights is None:
+        return HeuristicWeights()
+    if isinstance(weights, HeuristicWeights):
+        return weights
+    return HeuristicWeights.from_list(weights)
+
+
+def _get_row_feature_tables(
+    mono_power: float,
+    sum_power: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    key = (float(mono_power), float(sum_power))
+    cached = _ROW_FEATURE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    codes = np.arange(65536, dtype=np.uint64)
+    ranks = np.zeros((65536, 4), dtype=np.float64)
+    ranks[:, 0] = (codes >> 0) & 0xf
+    ranks[:, 1] = (codes >> 4) & 0xf
+    ranks[:, 2] = (codes >> 8) & 0xf
+    ranks[:, 3] = (codes >> 12) & 0xf
+
+    empties = np.sum(ranks == 0, axis=1)
+
+    nonzero = ranks > 0
+    sum_penalties = np.sum(
+        np.where(nonzero, ranks ** sum_power, 0.0),
+        axis=1,
+    )
+
+    diff = np.diff(ranks, axis=1)
+    pow_ranks = ranks ** mono_power
+    left_c = np.where(diff < 0, pow_ranks[:, :-1] - pow_ranks[:, 1:], 0.0)
+    right_c = np.where(diff >= 0, pow_ranks[:, 1:] - pow_ranks[:, :-1], 0.0)
+    mono_penalties = np.minimum(np.sum(left_c, axis=1), np.sum(right_c, axis=1))
+
+    merges = np.zeros(65536, dtype=np.float64)
+    for code in range(65536):
+        prev = 0
+        counter = 0
+        for k in range(4):
+            rank = int(ranks[code, k])
+            if rank == 0:
+                continue
+            if prev == rank:
+                counter += 1
+            else:
+                if counter > 0:
+                    merges[code] += 1 + counter
+                    counter = 0
+                prev = rank
+        if counter > 0:
+            merges[code] += 1 + counter
+
+    tables = (empties, merges, mono_penalties, sum_penalties)
+    _ROW_FEATURE_CACHE[key] = tables
+    return tables
+
+
+def run_heuristic_game(
+    weights: HeuristicWeights | list[float] | None = None,
+    seed: int | None = None,
+    max_depth: int = 2,
+) -> dict[str, int]:
+    return run_heuristic_games(weights=weights, seeds=[seed], max_depth=max_depth)[0]
+
+
+def run_heuristic_games(
+    weights: HeuristicWeights | list[float] | None,
+    seeds: list[int | None],
+    max_depth: int = 2,
+) -> list[dict[str, int]]:
+    from game.game import Game
+
+    config = _coerce_weights(weights)
+    agent = HeuristicAgent(weights=config, max_depth=max_depth)
+    results: list[dict[str, int]] = []
+
+    for seed in seeds:
+        game = Game(seed=seed)
+        agent.reset()
+        game.reset()
+
+        steps = 0
+        while True:
+            action = agent.get_action_bits(game.board.bits)
+            _, _, done, info = game.step(action, return_state=False)
+
+            if info.get("invalid"):
+                valid_moves = game.board.get_valid_moves()
+                if not valid_moves:
+                    break
+                _, _, done, _ = game.step(valid_moves[0], return_state=False)
+
+            steps += 1
+            if done:
+                break
+
+        results.append(
+            {
+                "score": int(game.score),
+                "max_tile": int(game.max_tile),
+                "steps": steps,
+            }
+        )
+
+    return results
 
 
 class HeuristicAgent(Agent):
@@ -93,6 +210,34 @@ class HeuristicAgent(Agent):
         return best_action
 
     # ── 搜索树节点 ────────────────────────────────────────────────────
+
+    def get_action_bits(self, rank_board: int) -> int:
+        """Return the best move for a rank-encoded bitboard."""
+        best_score = -float('inf')
+        best_action = UP
+
+        distinct = bitboard.count_distinct_tiles(rank_board)
+        dynamic_depth = min(self.max_depth, max(3, distinct - 2))
+        self._trans_table = {}
+
+        execute_move = bitboard.execute_move
+        chance_node = self._chance_node
+        for direction in _DIRECTIONS:
+            new_board, _, changed = execute_move(rank_board, direction)
+            if not changed:
+                continue
+
+            score = chance_node(
+                new_board,
+                curdepth=0,
+                depth_limit=dynamic_depth,
+                cprob=1.0,
+            )
+            if score > best_score:
+                best_score = score
+                best_action = direction
+
+        return best_action
 
     def _chance_node(self,
                      board: int,
@@ -208,6 +353,17 @@ class HeuristicAgent(Agent):
         耗时约 80ms（仅初始化时执行一次）。
         """
         w = self.weights
+        empties, merges, mono_p, sum_penalties = _get_row_feature_tables(
+            mono_power=w.mono_power,
+            sum_power=w.sum_power,
+        )
+        table = (w.w_lost_penalty
+                 + w.w_empty * empties
+                 + w.w_merges * merges
+                 - w.w_monotonicity * mono_p
+                 - w.w_sum * sum_penalties)
+        return table.astype(np.float64)
+
         codes = np.arange(65536, dtype=np.uint64)
 
         # 解码所有行：将 16-bit 编码展开为 (65536, 4) 的 rank 矩阵

@@ -1,145 +1,196 @@
-"""2048 AI 智能体评估脚本。
+"""Evaluate the 2048 heuristic agent over many independent games."""
 
-每局实时打印得分、最大方块和累积分布，全部完成后输出汇总报告。
-
-用法：
-  python eval/evaluate.py                      # 默认 100 局
-  python eval/evaluate.py --games 500          # 自定义局数
-  python eval/evaluate.py --seed 42            # 指定种子
-"""
+from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
+
+try:
+    import multiprocess as mp
+except ImportError:  # pragma: no cover - standard-library fallback
+    import multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from game.game import Game
-from agent.heuristic import HeuristicAgent
 from agent.config import HeuristicWeights
+from agent.heuristic import HeuristicAgent, run_heuristic_game, run_heuristic_games
 
-# 关注的大方块阈值
 _WATCH_TILES = [256, 512, 1024, 2048]
 
 
-# ── 时间格式化 ──────────────────────────────────────────────────────────
+def resolve_worker_count(requested: int, task_count: int | None = None) -> int:
+    """Return the worker count to use. 0 means all logical CPUs."""
+    if requested < 0:
+        raise ValueError("workers must be >= 0")
+    if requested == 0:
+        requested = os.cpu_count() or 1
+    worker_count = max(1, requested)
+    if task_count is not None:
+        worker_count = min(worker_count, max(1, task_count))
+    return worker_count
+
 
 def _fmt_time(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
-    elif seconds < 3600:
-        m, s = divmod(int(seconds), 60)
-        return f"{m}m{s:02d}s"
-    else:
-        h, rem = divmod(int(seconds), 3600)
-        m, s = divmod(rem, 60)
-        return f"{h}h{m:02d}m{s:02d}s"
+    if seconds < 3600:
+        minutes, secs = divmod(int(seconds), 60)
+        return f"{minutes}m{secs:02d}s"
+    hours, rem = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}h{minutes:02d}m{secs:02d}s"
 
 
-# ── 单局运行 ────────────────────────────────────────────────────────────
+def _game_task(
+    task: tuple[int, list[float], int | None, int],
+) -> tuple[int, float, dict[str, int]]:
+    index, weights, seed, depth = task
+    started = time.time()
+    result = run_heuristic_game(weights=weights, seed=seed, max_depth=depth)
+    return index, time.time() - started, result
 
-def run_single_game(agent: HeuristicAgent, seed: int | None = None) -> dict:
-    game = Game(seed=seed)
-    agent.reset()
-    game.reset()
 
-    steps = 0
-    while True:
-        action = agent.get_action(game.board)
-        _, _, done, info = game.step(action)
+def _game_batch_task(
+    task: tuple[list[int], list[float], list[int | None], int],
+) -> list[tuple[int, float, dict[str, int]]]:
+    indices, weights, seeds, depth = task
+    started = time.time()
+    results = run_heuristic_games(weights=weights, seeds=seeds, max_depth=depth)
+    elapsed = time.time() - started
+    per_game_elapsed = elapsed / len(results) if results else 0.0
+    return [
+        (index, per_game_elapsed, result)
+        for index, result in zip(indices, results)
+    ]
 
-        if info.get("invalid"):
-            # 智能体不应返回无效动作。若发生，尝试任意合法动作保底。
-            valid_moves = game.board.get_valid_moves()
-            if not valid_moves:
-                break
-            _, _, done, _ = game.step(valid_moves[0])
 
-        steps += 1
-        if done:
-            break
+def run_single_game(agent: HeuristicAgent, seed: int | None = None) -> dict[str, int]:
+    """Backward-compatible single-game helper."""
+    return run_heuristic_game(
+        weights=agent.weights,
+        seed=seed,
+        max_depth=agent.max_depth,
+    )
 
-    return {
-        "score": int(game.score),
-        "max_tile": int(game.board.max_tile),
-        "steps": steps,
+
+def _print_game_line(
+    index: int,
+    total: int,
+    elapsed: float,
+    result: dict[str, int],
+) -> None:
+    score = int(result["score"])
+    max_tile = int(result["max_tile"])
+    marks = {
+        tile: 1 if max_tile >= tile else 0
+        for tile in _WATCH_TILES
     }
+    print(
+        f"[{index + 1:>4}/{total}] {_fmt_time(elapsed):>6} | "
+        f"Score: {score:>7} | "
+        f"Max: {max_tile:>5} | "
+        f"(256:{marks[256]}  512:{marks[512]}  "
+        f"1024:{marks[1024]}  2048:{marks[2048]})"
+    )
 
 
-# ── 评估主函数 ──────────────────────────────────────────────────────────
+def evaluate(
+    agent: HeuristicAgent,
+    n_games: int = 100,
+    base_seed: int | None = None,
+    workers: int = 1,
+) -> dict:
+    if n_games <= 0:
+        raise ValueError("n_games must be positive")
 
-def evaluate(agent: HeuristicAgent,
-             n_games: int = 100,
-             base_seed: int | None = None) -> dict:
-    scores = []
-    max_tiles = []
-    steps_list = []
+    scores: list[int] = []
+    max_tiles: list[int] = []
+    steps_list: list[int] = []
+    results_by_index: list[dict[str, int] | None] = [None] * n_games
 
-    # 累积计数，显式 int 键避免任何类型混淆
-    cum_256 = 0
-    cum_512 = 0
-    cum_1024 = 0
-    cum_2048 = 0
-
+    worker_count = resolve_worker_count(workers, n_games)
+    weights = agent.weights.to_list()
+    depth = agent.max_depth
     start_time = time.time()
 
-    for i in range(n_games):
-        t0 = time.time()
-        seed = (base_seed + i) if base_seed is not None else None
-        result = run_single_game(agent, seed=seed)
-        dt = time.time() - t0
+    if worker_count <= 1:
+        for index in range(n_games):
+            seed = (base_seed + index) if base_seed is not None else None
+            started = time.time()
+            result = run_heuristic_game(
+                weights=weights,
+                seed=seed,
+                max_depth=depth,
+            )
+            elapsed = time.time() - started
+            results_by_index[index] = result
+            _print_game_line(index, n_games, elapsed, result)
+    else:
+        groups: list[list[int]] = [[] for _ in range(worker_count)]
+        for index in range(n_games):
+            groups[index % worker_count].append(index)
+        tasks = [
+            (
+                indices,
+                weights,
+                [
+                    (base_seed + index) if base_seed is not None else None
+                    for index in indices
+                ],
+                depth,
+            )
+            for indices in groups
+            if indices
+        ]
+        chunksize = max(1, len(tasks) // (worker_count * 4))
+        with contextlib.ExitStack() as stack:
+            context = mp.get_context("spawn")
+            pool = stack.enter_context(context.Pool(processes=worker_count))
+            for batch in pool.imap_unordered(
+                _game_batch_task,
+                tasks,
+                chunksize=chunksize,
+            ):
+                for index, elapsed, result in batch:
+                    results_by_index[index] = result
+                    _print_game_line(index, n_games, elapsed, result)
 
-        score = int(result["score"])
-        max_t = int(result["max_tile"])
-        steps = int(result["steps"])
-
-        scores.append(score)
-        max_tiles.append(max_t)
-        steps_list.append(steps)
-
-        # 累加：显式 Python int 比较，分条写死避免循环变量作用域隐患
-        if max_t >= 256:
-            cum_256 += 1
-        if max_t >= 512:
-            cum_512 += 1
-        if max_t >= 1024:
-            cum_1024 += 1
-        if max_t >= 2048:
-            cum_2048 += 1
-
-        # 每局一行——括号内为本局标记（1=达成, 0=未达成）
-        m256  = 1 if max_t >= 256  else 0
-        m512  = 1 if max_t >= 512  else 0
-        m1024 = 1 if max_t >= 1024 else 0
-        m2048 = 1 if max_t >= 2048 else 0
-        print(f"[{i+1:>4}/{n_games}] {_fmt_time(dt):>6} | "
-              f"Score: {score:>7} | "
-              f"Max: {max_t:>5} | "
-              f"(256:{m256}  512:{m512}  1024:{m1024}  2048:{m2048})")
+    for result in results_by_index:
+        if result is None:
+            continue
+        scores.append(int(result["score"]))
+        max_tiles.append(int(result["max_tile"]))
+        steps_list.append(int(result["steps"]))
 
     elapsed = time.time() - start_time
+    tile_cumulative = {
+        tile: sum(max_tile >= tile for max_tile in max_tiles)
+        for tile in _WATCH_TILES
+    }
 
     return {
         "scores": scores,
         "max_tiles": max_tiles,
         "steps_list": steps_list,
-        "tile_cumulative": {256: cum_256, 512: cum_512,
-                            1024: cum_1024, 2048: cum_2048},
+        "tile_cumulative": tile_cumulative,
         "total_games": n_games,
         "total_time": elapsed,
+        "workers": worker_count,
     }
 
-
-# ── 报告输出 ────────────────────────────────────────────────────────────
 
 def _std(values: list[float]) -> float:
     n = len(values)
     if n <= 1:
         return 0.0
     mean = sum(values) / n
-    variance = sum((x - mean) ** 2 for x in values) / (n - 1)
-    return variance ** 0.5
+    variance = sum((value - mean) ** 2 for value in values) / (n - 1)
+    return variance**0.5
 
 
 def print_report(results: dict) -> None:
@@ -152,83 +203,114 @@ def print_report(results: dict) -> None:
 
     print()
     print("=" * 60)
-    print("                      评 估 报 告")
+    print("Evaluation report")
     print("=" * 60)
-    print(f"总局数:        {total}")
-    print(f"总耗时:        {_fmt_time(elapsed)}")
+    print(f"Games:           {total}")
+    print(f"Workers:         {results.get('workers', 1)}")
+    print(f"Total time:      {_fmt_time(elapsed)}")
     if total > 0:
-        print(f"平均耗时:      {elapsed / total:.1f}s/局")
+        print(f"Average time:    {elapsed / total:.1f}s/game")
     print("-" * 60)
-    print(f"平均得分:      {sum(scores) / total:>10.1f}" if total > 0 else
-          "平均得分:       N/A")
-    print(f"最高得分:      {max(scores):>10}" if scores else
-          "最高得分:       N/A")
-    print(f"最低得分:      {min(scores):>10}" if scores else
-          "最低得分:       N/A")
-    print(f"得分标准差:    {_std(scores):>10.1f}")
-    print(f"平均步数:      {sum(steps_list) / total:>10.1f}" if total > 0 else
-          "平均步数:       N/A")
-    print(f"平均最大方块:  {sum(max_tiles) / total:>10.1f}" if total > 0 else
-          "平均最大方块:   N/A")
+    print(
+        f"Mean score:      {sum(scores) / total:>10.1f}"
+        if total > 0
+        else "Mean score:       N/A"
+    )
+    print(f"Max score:       {max(scores):>10}" if scores else "Max score:        N/A")
+    print(f"Min score:       {min(scores):>10}" if scores else "Min score:        N/A")
+    print(f"Score std:       {_std(scores):>10.1f}")
+    print(
+        f"Mean steps:      {sum(steps_list) / total:>10.1f}"
+        if total > 0
+        else "Mean steps:       N/A"
+    )
+    print(
+        f"Mean max tile:   {sum(max_tiles) / total:>10.1f}"
+        if total > 0
+        else "Mean max tile:    N/A"
+    )
     print("-" * 60)
 
-    # 最大方块分布（按实际出现的值统计）
-    from collections import Counter
     tile_dist = Counter(max_tiles)
     if tile_dist:
-        print("最大方块分布:")
+        print("Max tile distribution")
         for tile in sorted(tile_dist.keys()):
             count = tile_dist[tile]
             pct = 100 * count / total if total > 0 else 0
             bar = "#" * int(pct / 2)
-            print(f"    {tile:>6}: {count:>4} 局 ({pct:5.1f}%) {bar}")
+            print(f"    {tile:>6}: {count:>4} games ({pct:5.1f}%) {bar}")
 
     print("-" * 60)
-    for t in _WATCH_TILES:
-        count = tile_cumulative.get(t, 0)
+    for tile in _WATCH_TILES:
+        count = tile_cumulative.get(tile, 0)
         pct = 100 * count / total if total > 0 else 0
-        print(f"{t:>5} 达成率:  {count:>4}/{total} ({pct:5.1f}%)")
+        print(f"{tile:>5} rate:      {count:>4}/{total} ({pct:5.1f}%)")
     print("=" * 60)
 
 
-# ── 入口 ─────────────────────────────────────────────────────────────────
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
 
-def main():
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="2048 AI 启发式智能体评估工具"
+        description="Evaluate the 2048 heuristic agent."
     )
-    parser.add_argument("--games", type=int, default=100,
-                        help="测试局数（默认 100）")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="起始随机种子（默认 0）")
-    parser.add_argument("--depth", type=int, default=2,
-                        help="Expectimax 最大搜索深度上限（默认 2，可调高但会明显变慢）")
-    parser.add_argument("--weights", type=float, nargs=5, default=None,
-                        metavar=("W_LOST", "W_EMPTY", "W_MERGES",
-                                 "W_MONO", "W_SUM"),
-                        help="自定义启发式线性权重（5 个浮点数）")
+    parser.add_argument("--games", type=positive_int, default=100)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--depth",
+        type=positive_int,
+        default=2,
+        help="Expectimax max depth. Higher values are much slower.",
+    )
+    parser.add_argument(
+        "--weights",
+        type=float,
+        nargs=5,
+        default=None,
+        metavar=("W_LOST", "W_EMPTY", "W_MERGES", "W_MONO", "W_SUM"),
+    )
+    parser.add_argument(
+        "--workers",
+        type=non_negative_int,
+        default=1,
+        help="Worker processes for game evaluation. Use 0 for all CPUs.",
+    )
     args = parser.parse_args()
 
-    # 权重配置
     if args.weights is not None:
         weights = HeuristicWeights.from_list(args.weights)
-        print(f"权重: {weights}")
+        print(f"Weights: {weights}")
     else:
         weights = HeuristicWeights()
-        print(f"权重: [默认] {weights}")
+        print(f"Weights: [default] {weights}")
 
-    # 智能体
+    worker_count = resolve_worker_count(args.workers, args.games)
     agent = HeuristicAgent(weights=weights, max_depth=args.depth)
 
-    print(f"深度: {args.depth} | 局数: {args.games} | 种子: {args.seed}")
+    print(
+        f"Depth: {args.depth} | Games: {args.games} | "
+        f"Seed: {args.seed} | Workers: {worker_count}"
+    )
     print()
 
     results = evaluate(
         agent,
         n_games=args.games,
         base_seed=args.seed,
+        workers=worker_count,
     )
-
     print_report(results)
 
 

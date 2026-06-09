@@ -1,64 +1,41 @@
-# 第二部分：基于进化计算的 Heuristic 参数优化方案
+# 第二部分：Evolutionary Heuristic Optimization 实现说明
 
-本文档用于记录项目第二部分的工作纲要：在第一部分已经完成的
-Expectimax + heuristic 智能体基础上，使用进化计算方法自动优化启发式评估函数中的参数。
+本文档记录第二部分中已经完成的进化式参数优化实现。第一部分已经完成了基于 bitboard 和 Expectimax 的 heuristic agent，本部分不重新设计游戏智能体，而是在现有 heuristic 评估函数上自动搜索更优权重，并将训练、评估和结果保存流程工程化。
 
-当前 `agent/heuristic.py` 已经将 2048 棋盘底层操作切换为 bitboard，并通过行查表方式加速评估函数计算；
-`agent/config.py` 中的 `HeuristicWeights` 也已经为权重列表化、边界约束和后续遗传算法编码预留了接口。
-因此第二部分的重点不是重新设计智能体结构，而是在现有接口上构建一个可复现、可比较、可检查点恢复的参数搜索流程。
+相关实现主要位于：
+
+- `agent/config.py`
+- `agent/heuristic.py`
+- `eval/evaluate.py`
+- `eval/evolve_weights.py`
 
 ## 1. 优化目标
 
-本阶段目标是通过进化计算寻找一组更优的 heuristic 线性权重，使智能体在固定 Expectimax 深度下取得更稳定的游戏表现。
+当前 heuristic agent 的核心决策仍然是 Expectimax。Evolution 部分优化的是叶子节点启发式评估函数中的线性权重，使同一搜索深度下的策略更稳定、更容易达到高阶方块。
 
-主要优化指标包括：
+优化目标包括：
 
-- 平均得分提高。
-- 2048、4096、8192 等大方块达成率提高。
-- 多随机种子下表现更稳定，避免只对少数局面过拟合。
-- 保持当前 `HeuristicAgent` 的接口不变，使优化后的权重可以直接用于评估脚本、GUI 或后续学习模块。
+- 提高平均得分。
+- 提高 2048、4096、8192 达成率。
+- 避免只根据单局最高分选择参数。
+- 保持 `HeuristicAgent` 接口不变，使优化后的权重可以直接用于评估脚本、GUI 和后续神经网络/强化学习模块。
 
-需要注意的是，2048 的游戏结果具有较强随机性，单局得分不能代表参数优劣。
-因此优化过程必须使用多局固定随机种子评估，并在最终验证阶段使用独立种子集合。
+## 2. 染色体设计
 
-## 2. 当前 Heuristic 参数结构
+启发式评估函数采用逐行评分方式。棋盘的 4 行和 4 列分别被编码为 16-bit row code，然后查表得到每一行/列的评分。
 
-当前启发式评估函数采用 nneonneo/2048-ai 风格的逐行评分方式。
-棋盘被拆成 4 行和 4 列，共 8 个长度为 4 的行向量，每个行向量独立计算评分后求和。
-
-当前行评分形式为：
+行评分公式为：
 
 ```text
 row_score =
     w_lost_penalty
   + w_empty * empty_count
   + w_merges * merge_clusters
-  - w_monotonicity * mono_penalty
+  - w_monotonicity * monotonicity_penalty
   - w_sum * sum_penalty
 ```
 
-其中当前第一阶段建议优化的 5 个线性参数为：
-
-```text
-w_lost_penalty
-w_empty
-w_merges
-w_monotonicity
-w_sum
-```
-
-这 5 个参数已经由 `HeuristicWeights.to_list()` 和 `HeuristicWeights.from_list()` 暴露为列表形式，
-适合直接作为进化算法中的染色体。
-
-`mono_power` 和 `sum_power` 当前建议暂时固定。
-原因是这两个参数会改变非线性惩罚的尺度，一开始同时优化会扩大搜索空间，增加评估成本。
-当 5 个线性权重的优化流程稳定后，可以将它们扩展为第二阶段的 7 维染色体。
-
-## 3. 染色体编码与搜索范围
-
-本项目建议使用实数编码遗传算法，而不是二进制编码。
-
-染色体定义如下：
+进化算法直接优化 5 个线性权重：
 
 ```text
 chromosome = [
@@ -70,37 +47,67 @@ chromosome = [
 ]
 ```
 
-每个基因的取值范围直接使用 `HeuristicWeights.bounds`：
-
-```text
-w_lost_penalty: 100000.0 ~ 500000.0
-w_empty:          50.0 ~   1000.0
-w_merges:        100.0 ~   2000.0
-w_monotonicity:   10.0 ~    200.0
-w_sum:             1.0 ~     50.0
-```
-
-初始化种群时应将当前默认权重作为一个保留个体加入初始种群：
+默认权重为：
 
 ```text
 [200000.0, 270.0, 700.0, 47.0, 11.0]
 ```
 
-这样可以保证进化搜索至少不会完全脱离现有可用基线，并且后续每代结果都能和默认权重进行直接比较。
+实现中通过 `HeuristicWeights.to_list()` 和 `HeuristicWeights.from_list()` 在配置对象与染色体列表之间转换。因此 evolution 代码不需要了解 agent 内部细节，只需要传入权重列表即可完成评估。
 
-## 4. 进化算法设计
+## 3. 搜索范围
 
-建议第一版采用标准实数编码遗传算法，结构如下：
+代码保留了两套边界：
 
-- 种群规模：16 到 24。
-- 代数：20 到 40。
-- 精英保留：每代保留前 2 个个体。
-- 选择方法：锦标赛选择，锦标赛规模为 3。
-- 交叉方法：BLX-alpha 或模拟二进制交叉。
-- 变异方法：按参数范围进行高斯扰动。
-- 边界处理：变异后将参数截断回合法范围。
+```text
+default bounds:
+  w_lost_penalty: 100000.0 ~ 500000.0
+  w_empty:             50.0 ~   1000.0
+  w_merges:           100.0 ~   2000.0
+  w_monotonicity:      10.0 ~    200.0
+  w_sum:                1.0 ~     50.0
 
-其中 BLX-alpha 的实现较简单，适合作为第一版：
+narrow bounds:
+  w_lost_penalty: 150000.0 ~ 300000.0
+  w_empty:           200.0 ~    700.0
+  w_merges:          400.0 ~   1400.0
+  w_monotonicity:     40.0 ~    150.0
+  w_sum:               7.0 ~     25.0
+```
+
+正式 v2 实验使用了 `narrow` 搜索范围，并固定 `w_lost_penalty = 200000.0`。原因是 `w_lost_penalty` 是逐行常数项，在许多候选动作比较中影响较弱；固定它可以减少搜索维度，把评估预算集中在 `empty`、`merges`、`monotonicity` 和 `sum` 四个更直接影响策略排序的参数上。
+
+## 4. 种群初始化
+
+`eval/evolve_weights.py` 中的初始化策略包含两类个体：
+
+- 默认权重个体：保证初始种群包含当前可用 baseline。
+- 局部扰动个体：围绕默认权重按比例加入高斯噪声。
+- 随机个体：在搜索边界内均匀采样，用于提供多样性。
+
+正式实现默认使用较高比例的局部初始化：
+
+```text
+local_init_fraction = 0.75
+local_init_scale = 0.12
+```
+
+这样做是因为当前 heuristic 已经是可用策略，完全随机搜索容易浪费大量评估预算；围绕已知有效参数做局部搜索更适合本项目当前规模。
+
+## 5. 遗传算法流程
+
+每一代的基本流程如下：
+
+1. 对当前种群进行评估。
+2. 根据 fitness 对个体排序。
+3. 保留前 `elite_size` 个精英个体。
+4. 使用锦标赛选择产生父代。
+5. 使用 BLX-alpha 实数交叉生成子代。
+6. 对子代执行按参数范围缩放的高斯变异。
+7. 将所有基因裁剪回合法边界。
+8. 保存当代统计、最佳权重和 checkpoint。
+
+交叉公式为：
 
 ```text
 child_gene = uniform(
@@ -109,31 +116,17 @@ child_gene = uniform(
 )
 ```
 
-然后对每个 gene 执行边界截断。
-
-变异可以按如下方式执行：
+变异公式为：
 
 ```text
 gene = gene + normal(0, mutation_scale * parameter_range)
 ```
 
-初始建议：
+这种实数编码方式比二进制编码更直接，也更符合当前权重参数本身的连续数值特征。
 
-```text
-alpha = 0.3
-mutation_rate = 0.2
-mutation_scale = 0.08
-```
+## 6. 适应度函数
 
-如果连续多代最优适应度无明显提升，可以适当提高变异尺度；
-如果结果波动过大，则降低变异尺度并增加复评局数。
-
-## 5. 适应度函数
-
-适应度函数不能只使用单局得分，也不能只使用最高得分。
-建议综合平均得分、大方块达成率和稳定性。
-
-第一版适应度函数建议为：
+基础 fitness 使用多局统计指标综合计算：
 
 ```text
 fitness =
@@ -146,374 +139,141 @@ fitness =
 
 其中：
 
-- `mean_score` 表示多局平均分。
-- `rate_2048` 表示达到 2048 的比例。
-- `rate_4096` 表示达到 4096 的比例。
-- `rate_8192` 表示达到 8192 的比例。
-- `std_score` 表示得分标准差，用于惩罚不稳定策略。
+- `mean_score` 表示平均得分。
+- `rate_2048`、`rate_4096`、`rate_8192` 表示达到对应方块的比例。
+- `std_score` 用于惩罚结果波动。
 
-这个适应度函数的目的不是替代最终报告指标，而是为进化算法提供一个排序依据。
-最终结果仍应使用完整评估报告展示平均分、最高分、最低分、标准差、平均最大方块和最大方块分布。
-
-## 6. 分阶段评估策略
-
-当前 `eval/evaluate.py` 已经支持通过命令行传入权重：
+正式 v2 实验进一步启用了 `--baseline-paired`。该模式会在同一组随机种子上同时评估默认权重，并用候选权重相对默认权重的提升作为排序依据：
 
 ```text
-python eval/evaluate.py --games 50 --seed 0 --depth 2 --weights ...
+paired_fitness =
+    candidate.mean_score - baseline.mean_score
+  + 3000 * (candidate.rate_4096 - baseline.rate_4096)
+  + 8000 * (candidate.rate_8192 - baseline.rate_8192)
+  - 0.02 * (candidate.std_score - baseline.std_score)
 ```
 
-但实际测试中，`depth=2` 的单局运行时间已经较长。
-因此进化算法不能对每个个体都进行大量完整评估，否则计算成本会非常高。
+paired fitness 的作用是降低 2048 随机生成方块带来的噪声。同一代中候选权重面对相同 seed 集合，因此相对提升比绝对分数更适合作为训练时的选择信号。
 
-建议采用分阶段评估：
+## 7. 分阶段评估
 
-### 6.1 快速筛选
-
-快速筛选阶段用于淘汰明显较差的个体。
-
-建议配置：
+由于 depth 2 的 Expectimax 单局成本较高，进化过程中不能对所有个体都进行大量完整评估。因此实现采用分阶段评估：
 
 ```text
-depth = 1
-games = 2 ~ 4
+fast stage:
+  games_fast
+  depth_fast
+
+full stage:
+  games_full
+  depth_full
+  只评估 fast stage 排名前 full_fraction 的个体
+
+validation stage:
+  validation_games
+  depth_full
+  用独立 validation seed 验证当前最优个体
 ```
 
-该阶段只用于粗略判断，不作为最终结果依据。
-
-### 6.2 正式选择
-
-正式选择阶段用于评估每代候选中的较优个体。
-
-建议配置：
+正式 v2 训练配置为：
 
 ```text
-depth = 2
-games = 3 ~ 5
+population = 12
+generations = 20
+games_fast = 3
+games_full = 8
+validation_games = 10
+depth_fast = 1
+depth_full = 2
+full_fraction = 0.35
+baseline_paired = true
+bounds_mode = narrow
+fix_lost_penalty = true
 ```
 
-每代可以先用快速筛选评估全部个体，然后只对排名靠前的 25% 到 40% 个体进行正式评估。
+此外，代码中还实现了可选的 racing schedule，也就是 successive halving。它允许把评估过程拆成多轮，先用低成本配置评估全部个体，再逐步提高局数或深度，只让排名靠前的候选进入下一轮。
 
-### 6.3 独立验证
+## 8. 并行化实现
 
-独立验证阶段用于验证当前最优个体是否真的优于默认权重。
+为了提升训练和评估速度，本阶段对 evaluation 和 evolution 都加入了多进程并行能力。代码优先导入 `multiprocess`，若环境中不可用则回退到 Python 标准库 `multiprocessing`：
 
-建议配置：
+```python
+try:
+    import multiprocess as mp
+except ImportError:
+    import multiprocessing as mp
+```
+
+并行粒度分为两层：
+
+- `eval/evaluate.py`：一个评估任务内部可以用 `--workers` 将多局游戏分发给多个 worker process。
+- `eval/evolve_weights.py`：训练时可以用 `--workers` 并行评估多个候选权重。
+
+在 Windows 环境下使用 `spawn` context 创建进程池，避免 fork 语义不可用的问题：
+
+```python
+context = mp.get_context("spawn")
+pool = context.Pool(processes=worker_count)
+```
+
+为了减少进程间通信开销，`evaluate.py` 并不是把每一局都单独提交给 worker，而是先按 worker 数量把游戏编号分组，每个 worker 在本进程内连续运行一批游戏。`agent/heuristic.py` 中对应提供了：
 
 ```text
-depth = 2
-games = 20 ~ 50
-seed = validation_seed_start
+run_heuristic_game(...)
+run_heuristic_games(...)
 ```
 
-验证种子不能与进化训练阶段完全相同，否则容易高估优化效果。
+`run_heuristic_games` 会在同一个 worker 内复用同一个 `HeuristicAgent`，避免每局都重新构建 row table，从而降低批量评估开销。
 
-## 7. 随机种子控制
+## 9. 结果保存与恢复
 
-为了保证不同个体之间比较公平，每一代内部应使用相同的随机种子集合。
-这可以减少 2048 随机生成方块带来的噪声。
-
-例如第 `g` 代可以使用：
+训练输出目录中保存三类文件：
 
 ```text
-seeds = [base_seed + g * 1000 + i for i in range(games)]
+evolution_results_v2/
+  best_weights.json
+  checkpoint.json
+  generations.csv
 ```
 
-如果希望进一步降低噪声，也可以固定一组训练种子：
+其中：
 
-```text
-train_seeds = [0, 1, 2, 3, 4]
-validation_seeds = [10000, 10001, ..., 10049]
+- `best_weights.json` 保存当前验证阶段最优权重及其指标。
+- `checkpoint.json` 保存种群、当前代数、配置、随机状态和最佳个体，可用于中断后恢复。
+- `generations.csv` 保存每代所有候选的排序、fitness、分数、达成率和权重，便于报告分析。
+
+如果训练过程中 terminal 被关闭，可以使用：
+
+```powershell
+python eval/evolve_weights.py --output evolution_results_v2 --resume evolution_results_v2/checkpoint.json
 ```
 
-训练种子用于进化选择，验证种子只用于最终比较。
+实际恢复时仍应补齐与原训练一致的参数，例如 `population`、`generations`、`games-fast`、`games-full`、`depth-fast`、`depth-full` 和 `workers`，以保持配置一致。
 
-## 8. 建议文件结构
+## 10. 最终评估接口
 
-第一版实现可以保持轻量，直接新增一个进化优化入口：
+最终对照实验使用 `eval/evaluate.py` 完成。默认权重命令为：
 
-```text
-eval/evolve_weights.py
+```powershell
+python eval/evaluate.py --games 300 --seed 20260608 --depth 2 --workers 20
 ```
 
-如果后续功能继续扩展，再拆分为独立目录：
+进化权重命令为：
 
-```text
-evolution/
-    genetic.py
-    fitness.py
-    checkpoint.py
-    results/
+```powershell
+python eval/evaluate.py --games 300 --seed 20260608 --depth 2 --workers 20 --weights 200000 459.779989788 800.537950377 41.1437746442 11.214963378
 ```
 
-其中建议职责如下：
+二者使用相同游戏数、相同起始 seed、相同搜索深度和相同 worker 数量。这样可以把差异主要归因于 heuristic 权重，而不是评估环境或随机性。
 
-```text
-genetic.py      # 种群初始化、选择、交叉、变异、精英保留
-fitness.py      # 多局游戏评估、适应度计算
-checkpoint.py   # 保存和恢复种群、最优权重、随机状态
-results/        # 保存每代统计结果和最终权重
-```
+## 11. 与后续工作的关系
 
-为了和当前项目结构保持一致，第一版优先实现 `eval/evolve_weights.py` 即可。
-当第二部分逻辑稳定后，再考虑拆分为独立包。
+本阶段完成后，项目获得了一个可复用的自动调参流程。后续神经网络或强化学习部分可以复用以下成果：
 
-## 9. 命令行接口设计
+- 更强的 heuristic baseline。
+- 并行化评估框架。
+- 多 seed 评估和结果统计逻辑。
+- checkpoint 和实验记录格式。
+- 通过 `run_heuristic_games` 批量生成游戏结果的接口。
 
-建议优化脚本支持以下命令行参数：
-
-```text
-python eval/evolve_weights.py \
-  --population 20 \
-  --generations 30 \
-  --games-fast 3 \
-  --games-full 5 \
-  --depth-fast 1 \
-  --depth-full 2 \
-  --seed 0 \
-  --output evolution_results
-```
-
-关键参数说明：
-
-- `--population` 控制种群规模。
-- `--generations` 控制进化代数。
-- `--games-fast` 控制快速筛选局数。
-- `--games-full` 控制正式评估局数。
-- `--depth-fast` 控制快速筛选的 Expectimax 深度。
-- `--depth-full` 控制正式评估的 Expectimax 深度。
-- `--seed` 控制进化过程随机性。
-- `--output` 控制结果保存目录。
-
-每代建议输出：
-
-```text
-generation
-best_fitness
-mean_fitness
-best_weights
-mean_score
-std_score
-max_tile_distribution
-elapsed_seconds
-```
-
-## 10. 检查点与结果保存
-
-由于评估耗时较长，优化脚本必须支持检查点保存。
-
-每代结束后至少保存：
-
-```text
-generation
-population
-fitness_values
-best_weights
-best_metrics
-random_state
-config
-```
-
-建议保存为 JSON 或 pickle。
-其中 JSON 适合保存最终结果和报告数据，pickle 适合保存可恢复的完整运行状态。
-
-最终应额外保存一个简洁的最优权重文件：
-
-```text
-best_weights.json
-```
-
-示例内容：
-
-```json
-{
-  "weights": [200000.0, 270.0, 700.0, 47.0, 11.0],
-  "fitness": 0.0,
-  "metrics": {
-    "mean_score": 0.0,
-    "std_score": 0.0,
-    "rate_2048": 0.0,
-    "rate_4096": 0.0,
-    "rate_8192": 0.0
-  }
-}
-```
-
-## 11. 实验对照
-
-最终报告中至少需要包含以下对照实验：
-
-### 11.1 默认权重基线
-
-使用当前 `HeuristicWeights()` 默认参数，在独立验证种子上评估。
-
-### 11.2 进化权重结果
-
-使用 GA 得到的最优参数，在相同独立验证种子上评估。
-
-### 11.3 消融实验
-
-建议至少进行一次消融：
-
-```text
-固定 w_lost_penalty，只优化其余 4 个权重
-```
-
-因为 `w_lost_penalty` 是逐行常数项，在部分搜索比较场景中可能会被抵消。
-通过消融可以判断它是否真的需要参与优化。
-
-## 12. 风险点
-
-### 12.1 评估成本过高
-
-Expectimax 搜索本身计算量较大。
-如果直接使用大种群、多局数和较高搜索深度，优化过程会非常慢。
-
-应对方式：
-
-- 使用分阶段评估。
-- 先小规模 smoke test。
-- 保存检查点。
-- 优先优化 5 个线性权重。
-
-### 12.2 随机噪声导致误判
-
-2048 的随机生成方块会导致单局结果波动较大。
-
-应对方式：
-
-- 每个个体使用多局平均结果。
-- 同一代个体使用相同随机种子集合。
-- 最终使用独立验证种子。
-
-### 12.3 对训练种子过拟合
-
-如果长期使用固定少量种子，GA 可能只优化这些种子下的表现。
-
-应对方式：
-
-- 训练阶段可以轮换种子集合。
-- 验证阶段必须使用未参与进化的种子。
-- 报告中同时展示均值和标准差。
-
-### 12.4 参数尺度差异较大
-
-不同权重的数量级差异明显，例如 `w_lost_penalty` 是十万级，而 `w_sum` 是十级。
-
-应对方式：
-
-- 变异按参数范围的比例执行，而不是使用统一绝对扰动。
-- 交叉后进行边界截断。
-- 后续可以考虑归一化编码到 `[0, 1]` 区间。
-
-## 13. 实施步骤
-
-### Step 1: 封装权重评估函数
-
-实现：
-
-```text
-evaluate_weights(weights, games, seed, depth) -> metrics
-```
-
-该函数内部创建：
-
-```text
-HeuristicWeights.from_list(weights)
-HeuristicAgent(weights=..., max_depth=depth)
-Game(seed=...)
-```
-
-并返回多局统计结果。
-
-### Step 2: 实现 GA 基础流程
-
-实现：
-
-- 初始化种群。
-- 适应度评估。
-- 锦标赛选择。
-- 实数交叉。
-- 高斯变异。
-- 精英保留。
-- 每代统计输出。
-
-### Step 3: 加入检查点
-
-每代结束保存当前状态。
-如果程序中断，可以从最近一代继续运行。
-
-### Step 4: 小规模 smoke test
-
-先运行：
-
-```text
-python eval/evolve_weights.py --population 4 --generations 2 --games-fast 1 --games-full 1 --depth-fast 1 --depth-full 1
-```
-
-确认流程、日志、结果保存和权重传递都正确。
-
-### Step 5: 正式小规模搜索
-
-建议初始正式配置：
-
-```text
-python eval/evolve_weights.py --population 16 --generations 20 --games-fast 3 --games-full 3 --depth-fast 1 --depth-full 2
-```
-
-### Step 6: 独立验证
-
-将默认权重和最优进化权重放到相同验证种子上比较：
-
-```text
-python eval/evaluate.py --games 50 --seed 10000 --depth 2 --weights ...
-```
-
-最终以独立验证结果作为报告结论。
-
-## 14. 预期交付
-
-第二部分完成后应包含：
-
-- 一个可运行的进化优化脚本。
-- 一个保存最优权重的结果文件。
-- 每代进化统计日志。
-- 默认权重与进化权重的对照评估结果。
-- 对优化效果、随机性和局限性的说明。
-
-本阶段完成后，项目将具备自动调参能力。
-后续监督学习或强化学习模块可以直接复用优化后的 heuristic 权重作为更强的搜索基线。
-
-
-
-• 你现在可以直接运行我新增的脚本来开始优化。
-
-  先建议跑一个小规模确认流程：
-
-  python eval/evolve_weights.py --population 4 --generations 2 --games-fast 1 --games-full 1 --depth-fast 1 --depth-full 1 --elite-size 1 --tournament-size 2 --seed 0 --output
-  evolution_results_test
-
-  确认没问题后，跑正式一点的初始实验：
-
-  python eval/evolve_weights.py --population 16 --generations 20 --games-fast 3 --games-full 3 --depth-fast 1 --depth-full 2 --seed 0 --output evolution_results
-
-  运行过程中它会输出每代最优结果，并保存：
-
-  evolution_results/generations.csv
-  evolution_results/checkpoint.json
-  evolution_results/best_weights.json
-
-  如果中途中断，可以恢复：
-
-  python eval/evolve_weights.py --population 16 --generations 20 --games-fast 3 --games-full 3 --depth-fast 1 --depth-full 2 --seed 0 --output evolution_results --resume
-  evolution_results/checkpoint.json
-
-  优化完成后，打开 evolution_results/best_weights.json，里面的 weights 就是最优参数。然后用现有评估脚本做独立验证，例如：
-
-  python eval/evaluate.py --games 50 --seed 10000 --depth 2 --weights 437768.74061 770.056682793 899.086003579 59.1941825557 26.0524613471
-
-  再和默认权重对照：
-
-  python eval/evaluate.py --games 50 --seed 10000 --depth 2
-
-  重点看平均得分、最大方块分布、2048/4096/8192 达成率。不要只看 GA 训练过程里的单次最优，因为 2048 随机性很强，最终结论要以独立 seed 的 50 局左右评估为准。
+因此 evolution 部分不仅提升了当前 Expectimax agent 的性能，也为后续大规模训练和评估提供了工程基础。
